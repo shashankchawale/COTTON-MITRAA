@@ -1,0 +1,1248 @@
+require('dotenv').config();
+const express = require('express');
+const mongoose = require('mongoose');
+const session = require('express-session');
+const cors = require('cors');
+const path = require('path');
+const axios = require('axios');
+const http = require('http');
+const { Server } = require('socket.io');
+const CryptoJS = require('crypto-js');
+
+const ML_SERVER_URL = 'http://localhost:5001';
+const ENCRYPTION_KEY = process.env.MSG_ENCRYPTION_KEY || 'cotton-mitra-e2e-secret-2026';
+
+let isDbConnected = false;
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*', credentials: true } });
+
+// ─── Middleware ────────────────────────────────────────────────────────────────
+app.use(cors({ origin: true, credentials: true }));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(express.static(path.join(__dirname, 'public')));
+
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'cotton-mitra-secret-2026',
+  resave: false,
+  saveUninitialized: false,
+  cookie: { secure: false, maxAge: 24 * 60 * 60 * 1000 }
+}));
+
+// ─── MongoDB Connection ────────────────────────────────────────────────────────
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/cotton_mitra';
+
+mongoose.connect(MONGO_URI)
+  .then(async () => {
+    console.log('✅ MongoDB connected:', MONGO_URI);
+    isDbConnected = true;
+    await seedDatabase();
+  })
+  .catch(err => {
+    console.error('❌ MongoDB connection failed:', err.message);
+    console.log('⚠️  Running in demo mode with sample data (no MongoDB)');
+  });
+
+// ─── Models ───────────────────────────────────────────────────────────────────
+const inventorySchema = new mongoose.Schema({
+  batchId:     { type: String, required: true, unique: true },
+  grade:       { type: String, enum: ['Premium', 'Standard', 'Economy'], default: 'Standard' },
+  bales:       { type: Number, default: 0 },
+  warehouse:   { type: String, default: 'Warehouse A' },
+  location:    { type: String, default: 'Section 1' },
+  harvestDate: { type: Date, default: Date.now },
+  arrival_date:{ type: Date, default: Date.now }, // Added for aging analysis
+  status:      { type: String, enum: ['In Stock', 'Reserved', 'Shipped', 'Low Stock'], default: 'In Stock' },
+  pricePerBale:{ type: Number, default: 1200 },
+  humidity:    { type: Number, default: 55 },
+  temperature: { type: Number, default: 22 },
+  notes:       { type: String, default: '' },
+  addedAt:     { type: Date, default: Date.now }
+});
+
+const shipmentSchema = new mongoose.Schema({
+  shipmentId:  { type: String, required: true, unique: true },
+  destination: { type: String, required: true },
+  bales:       { type: Number, default: 0 },
+  status:      { type: String, enum: ['Pending', 'In Transit', 'Delivered', 'Cancelled'], default: 'Pending' },
+  scheduledDate: { type: Date },
+  deliveredDate: { type: Date },
+  carrier:     { type: String, default: 'AgriFreight Ltd' },
+  createdAt:   { type: Date, default: Date.now }
+});
+
+const alertSchema = new mongoose.Schema({
+  type:       { type: String, enum: ['danger', 'warning', 'info', 'success'], default: 'info' },
+  message:    { type: String, required: true },
+  resolved:   { type: Boolean, default: false },
+  source:     { type: String, default: 'System' },
+  createdAt:  { type: Date, default: Date.now }
+});
+
+const forecastSchema = new mongoose.Schema({
+  month:       { type: String, required: true },
+  year:        { type: Number, required: true },
+  predicted:   { type: Number, default: 0 },
+  actual:      { type: Number, default: null },
+  rainfall:    { type: Number, default: 0 },
+  temperature: { type: Number, default: 0 },
+  createdAt:   { type: Date, default: Date.now }
+});
+
+const chatSchema = new mongoose.Schema({
+  sessionId: { type: String, required: true },
+  role:      { type: String, enum: ['user', 'assistant'], required: true },
+  content:   { type: String, required: true },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const yieldSchema = new mongoose.Schema({
+  month:  { type: String, required: true },
+  year:   { type: Number, required: true },
+  bales:  { type: Number, default: 0 },
+  grade:  { type: String, default: 'Standard' },
+  createdAt: { type: Date, default: Date.now }
+});
+
+// ─── Secure Communication Models ──────────────────────────────────────────────
+const userProfileSchema = new mongoose.Schema({
+  userId:      { type: String, required: true, unique: true },
+  name:        { type: String, required: true },
+  role:        { type: String, enum: ['farmer', 'warehouse'], required: true },
+  email:       { type: String, default: '' },
+  phone:       { type: String, default: '' },
+  location:    { type: String, default: '' },
+  warehouse:   { type: String, default: '' }, // warehouse name for owners
+  avatar:      { type: String, default: '' },
+  isOnline:    { type: Boolean, default: false },
+  lastSeen:    { type: Date, default: Date.now },
+  createdAt:   { type: Date, default: Date.now }
+});
+
+const conversationSchema = new mongoose.Schema({
+  participants: [{ type: String, required: true }], // userId array
+  lastMessage:  { type: String, default: '' },
+  lastMessageAt:{ type: Date, default: Date.now },
+  createdAt:    { type: Date, default: Date.now }
+});
+
+const directMessageSchema = new mongoose.Schema({
+  conversationId: { type: mongoose.Schema.Types.ObjectId, ref: 'Conversation', required: true },
+  senderId:       { type: String, required: true },
+  receiverId:     { type: String, required: true },
+  content:        { type: String, required: true }, // encrypted content
+  contentType:    { type: String, enum: ['text', 'image', 'file', 'price_quote'], default: 'text' },
+  isRead:         { type: Boolean, default: false },
+  readAt:         { type: Date },
+  createdAt:      { type: Date, default: Date.now }
+});
+
+const Inventory  = mongoose.model('Inventory',  inventorySchema);
+const Shipment   = mongoose.model('Shipment',   shipmentSchema);
+const Alert      = mongoose.model('Alert',      alertSchema);
+const Forecast   = mongoose.model('Forecast',   forecastSchema);
+const Chat       = mongoose.model('Chat',       chatSchema);
+const Yield      = mongoose.model('Yield',      yieldSchema);
+const UserProfile = mongoose.model('UserProfile', userProfileSchema);
+const Conversation = mongoose.model('Conversation', conversationSchema);
+const DirectMessage = mongoose.model('DirectMessage', directMessageSchema);
+
+// ─── Database Seeder ──────────────────────────────────────────────────────────
+async function seedDatabase() {
+  try {
+    const invCount = await Inventory.countDocuments();
+    if (invCount > 0) { console.log('📦 Database already seeded.'); return; }
+    
+    console.log('🌱 Seeding database with sample data...');
+
+    // Inventory with varied arrival dates for aging analysis
+    const now = new Date();
+    const inventoryData = [
+      { batchId: 'BATCH-001', grade: 'Premium', bales: 820, warehouse: 'Warehouse A', location: 'Section 1', status: 'In Stock', pricePerBale: 1450, humidity: 52, temperature: 21, arrival_date: new Date(now.getTime() - 10 * 24 * 60 * 60 * 1000) },
+      { batchId: 'BATCH-002', grade: 'Premium', bales: 650, warehouse: 'Warehouse A', location: 'Section 2', status: 'Reserved', pricePerBale: 1450, humidity: 54, temperature: 22, arrival_date: new Date(now.getTime() - 95 * 24 * 60 * 60 * 1000) }, // AGING
+      { batchId: 'BATCH-003', grade: 'Standard', bales: 480, warehouse: 'Warehouse B', location: 'Section 1', status: 'In Stock', pricePerBale: 1200, humidity: 61, temperature: 23, arrival_date: new Date(now.getTime() - 45 * 24 * 60 * 60 * 1000) },
+      { batchId: 'BATCH-004', grade: 'Standard', bales: 390, warehouse: 'Warehouse B', location: 'Section 2', status: 'In Stock', pricePerBale: 1200, humidity: 58, temperature: 22, arrival_date: new Date(now.getTime() - 100 * 24 * 60 * 60 * 1000) }, // AGING
+      { batchId: 'BATCH-005', grade: 'Economy',  bales: 120, warehouse: 'Warehouse C', location: 'Section 1', status: 'Low Stock', pricePerBale: 900, humidity: 57, temperature: 24, arrival_date: new Date(now.getTime() - 5 * 24 * 60 * 60 * 1000) },
+      { batchId: 'BATCH-006', grade: 'Premium', bales: 950, warehouse: 'Warehouse A', location: 'Section 3', status: 'In Stock', pricePerBale: 1480, humidity: 50, temperature: 20, arrival_date: new Date(now.getTime() - 120 * 24 * 60 * 60 * 1000) }, // AGING
+      { batchId: 'BATCH-007', grade: 'Standard', bales: 580, warehouse: 'Warehouse C', location: 'Section 2', status: 'In Stock', pricePerBale: 1220, humidity: 55, temperature: 22, arrival_date: new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000) },
+      { batchId: 'BATCH-008', grade: 'Economy',  bales: 90,  warehouse: 'Warehouse C', location: 'Section 3', status: 'Low Stock', pricePerBale: 880, humidity: 60, temperature: 25, arrival_date: new Date(now.getTime() - 20 * 24 * 60 * 60 * 1000) },
+      { batchId: 'BATCH-009', grade: 'Premium', bales: 760, warehouse: 'Warehouse A', location: 'Section 4', status: 'Reserved', pricePerBale: 1460, humidity: 51, temperature: 21, arrival_date: new Date(now.getTime() - 15 * 24 * 60 * 60 * 1000) },
+      { batchId: 'BATCH-010', grade: 'Standard', bales: 210, warehouse: 'Warehouse B', location: 'Section 3', status: 'Low Stock', pricePerBale: 1180, humidity: 59, temperature: 23, arrival_date: new Date(now.getTime() - 80 * 24 * 60 * 60 * 1000) },
+    ];
+    await Inventory.insertMany(inventoryData);
+
+    // Shipments
+    const shipmentsData = [
+      { shipmentId: 'SHIP-4501', destination: 'Mumbai Textile Hub', bales: 200, status: 'Delivered', scheduledDate: new Date('2026-03-15'), deliveredDate: new Date('2026-03-18') },
+      { shipmentId: 'SHIP-4502', destination: 'Ahmedabad Mills', bales: 350, status: 'Delivered', scheduledDate: new Date('2026-03-28'), deliveredDate: new Date('2026-04-01') },
+      { shipmentId: 'SHIP-4503', destination: 'Surat Yarn Factory', bales: 180, status: 'In Transit', scheduledDate: new Date('2026-04-05') },
+      { shipmentId: 'SHIP-4504', destination: 'Delhi Textile Market', bales: 420, status: 'Pending', scheduledDate: new Date('2026-04-10') },
+      { shipmentId: 'SHIP-4505', destination: 'Coimbatore Spinning Mill', bales: 310, status: 'Pending', scheduledDate: new Date('2026-04-12') },
+      { shipmentId: 'SHIP-4506', destination: 'Ludhiana Garment Cluster', bales: 150, status: 'Pending', scheduledDate: new Date('2026-04-15') },
+      { shipmentId: 'SHIP-4507', destination: 'Nagpur Cotton Exchange', bales: 280, status: 'In Transit', scheduledDate: new Date('2026-04-03') },
+      { shipmentId: 'SHIP-4508', destination: 'Indore Processing Unit', bales: 195, status: 'Pending', scheduledDate: new Date('2026-04-18') },
+      { shipmentId: 'SHIP-4509', destination: 'Pune Export Hub', bales: 500, status: 'Pending', scheduledDate: new Date('2026-04-20') },
+      { shipmentId: 'SHIP-4510', destination: 'Hyderabad Fabric Co.', bales: 225, status: 'Pending', scheduledDate: new Date('2026-04-22') },
+      { shipmentId: 'SHIP-4511', destination: 'Rajkot Cotton Mills', bales: 175, status: 'Pending', scheduledDate: new Date('2026-04-25') },
+      { shipmentId: 'SHIP-4512', destination: 'Jaipur Textile Zone', bales: 130, status: 'Pending', scheduledDate: new Date('2026-04-28') },
+    ];
+    await Shipment.insertMany(shipmentsData);
+
+    // Alerts
+    const alertsData = [
+      { type: 'danger',  message: 'Warehouse B humidity level exceeded 60% (currently 61%). Immediate action required to prevent bale damage.', source: 'Sensor', createdAt: new Date(Date.now() - 10 * 60000) },
+      { type: 'warning', message: 'Forecast update: Heavy rain expected next week in the Vidarbha region. Protect exposed bales and check drainage.', source: 'Weather', createdAt: new Date(Date.now() - 2 * 3600000) },
+      { type: 'info',    message: 'Shipment #SHIP-4502 to Ahmedabad Mills successfully loaded and dispatched. 350 bales.', source: 'Logistics', createdAt: new Date(Date.now() - 4 * 3600000) },
+      { type: 'warning', message: 'BATCH-005 and BATCH-008 are critically low on stock (< 150 bales each). Consider restocking.', source: 'Inventory', createdAt: new Date(Date.now() - 6 * 3600000) },
+      { type: 'success', message: 'AI Chatbot: Weekly inventory analysis complete. Premium grade stock at 85% capacity. All optimal.', source: 'AI', createdAt: new Date(Date.now() - 24 * 3600000) },
+      { type: 'info',    message: 'Scheduled maintenance for Warehouse A conveyor system on April 5, 2026. Plan accordingly.', source: 'Maintenance', createdAt: new Date(Date.now() - 48 * 3600000) },
+      { type: 'warning', message: 'Price fluctuation detected: Cotton spot price dropped 3.2% in MCX. Review pricing strategy.', source: 'Market', createdAt: new Date(Date.now() - 72 * 3600000) },
+    ];
+    await Alert.insertMany(alertsData);
+
+    // Forecast data (last 12 months)
+    const months = ['Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec','Jan','Feb','Mar'];
+    const forecastData = months.map((m, i) => ({
+      month: m,
+      year: i < 9 ? 2025 : 2026,
+      predicted: 380 + Math.floor(Math.random() * 200),
+      actual:    i < 11 ? 350 + Math.floor(Math.random() * 220) : null,
+      rainfall:  Math.floor(Math.random() * 120),
+      temperature: 22 + Math.floor(Math.random() * 12)
+    }));
+    await Forecast.insertMany(forecastData);
+
+    // Yield history
+    const yieldData = months.map((m, i) => ({
+      month: m,
+      year: i < 9 ? 2025 : 2026,
+      bales: 300 + Math.floor(Math.random() * 500),
+      grade: ['Premium','Standard','Economy'][i % 3]
+    }));
+    await Yield.insertMany(yieldData);
+
+    console.log('✅ Database seeded successfully!');
+  } catch (err) {
+    console.error('Seed error:', err.message);
+  }
+}
+
+// ─── Auth Middleware (Warehouse/Admin) ───────────────────────────────────────
+function requireAuth(req, res, next) {
+  if (req.session && req.session.user) return next();
+  return res.status(401).json({ success: false, message: 'Unauthorized' });
+}
+
+// ─── Farmer Auth Middleware ────────────────────────────────────────────────────
+function requireFarmerAuth(req, res, next) {
+  if (req.session && req.session.farmer) return next();
+  // For page requests, redirect to farmer login
+  const acceptsHtml = req.headers.accept && req.headers.accept.includes('text/html');
+  if (acceptsHtml) return res.redirect('/farmer/login');
+  return res.status(401).json({ success: false, message: 'Farmer authentication required' });
+}
+
+// ─── In-Memory OTP Store ──────────────────────────────────────────────────────
+// { phone: { otp, expiresAt } }
+const otpStore = {};
+
+function generateOTP() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+function cleanExpiredOTPs() {
+  const now = Date.now();
+  Object.keys(otpStore).forEach(phone => {
+    if (otpStore[phone].expiresAt < now) delete otpStore[phone];
+  });
+}
+
+// ─── Static Page Routes ───────────────────────────────────────────────────────
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+app.get('/login', (req, res) => res.sendFile(path.join(__dirname, 'public', 'login.html')));
+app.get('/dashboard', (req, res) => {
+  if (!req.session.user) return res.redirect('/login');
+  res.sendFile(path.join(__dirname, 'public', 'dashboard.html'));
+});
+
+// Farmer Static Assets (CSS, images etc. — no auth needed)
+app.use('/farmer/assets', express.static(path.join(__dirname, 'farmer')));
+
+// Farmer Login Page — public
+app.get('/farmer/login', (req, res) => {
+  // If already logged in as farmer, redirect to dashboard
+  if (req.session && req.session.farmer) return res.redirect('/farmer/dashboard');
+  res.sendFile(path.join(__dirname, 'farmer', 'login.html'));
+});
+
+// Farmer Landing Page — protected
+app.get('/farmer', (req, res) => {
+  if (!req.session || !req.session.farmer) return res.redirect('/farmer/login');
+  res.sendFile(path.join(__dirname, 'farmer', 'index.html'));
+});
+
+// Farmer Dashboard — protected
+app.get('/farmer/dashboard', (req, res) => {
+  if (!req.session || !req.session.farmer) return res.redirect('/farmer/login');
+  res.sendFile(path.join(__dirname, 'farmer', 'farmdashboard.html'));
+});
+
+// ─── Auth Routes (Warehouse/Admin) ────────────────────────────────────────────
+app.get('/api/config', (req, res) => {
+  res.json({ client_id: process.env.GOOGLE_CLIENT_ID || '' });
+});
+
+app.post('/api/login', (req, res) => {
+  const { email, password } = req.body;
+  if (email && password) {
+    req.session.user = { email, name: email.split('@')[0] };
+    return res.json({ success: true, redirect: '/dashboard' });
+  }
+  res.status(401).json({ success: false, message: 'Invalid credentials' });
+});
+
+app.post('/api/login/google', (req, res) => {
+  const { credential } = req.body;
+  if (credential) {
+    req.session.user = { email: 'manager@cottonmitra.com', name: 'Farm Manager', picture: null };
+    return res.json({ success: true, redirect: '/dashboard' });
+  }
+  res.status(401).json({ success: false, message: 'Invalid Google token' });
+});
+
+app.get('/api/session', (req, res) => {
+  if (req.session && req.session.user) {
+    return res.json({ success: true, user: req.session.user });
+  }
+  res.status(401).json({ success: false });
+});
+
+app.get('/api/logout', (req, res) => {
+  req.session.destroy();
+  res.redirect('/login');
+});
+
+// ─── Farmer Auth Routes (Phone OTP) ───────────────────────────────────────────
+
+// Step 1: Request OTP
+app.post('/api/farmer/send-otp', (req, res) => {
+  cleanExpiredOTPs();
+  const { phone } = req.body;
+
+  if (!phone || !/^[6-9]\d{9}$/.test(phone)) {
+    return res.status(400).json({ success: false, message: 'Invalid phone number. Must be a valid 10-digit Indian mobile number.' });
+  }
+
+  // Rate limit: max 3 OTP requests per phone per 10 minutes
+  if (otpStore[phone] && otpStore[phone].attempts >= 3 && otpStore[phone].expiresAt > Date.now()) {
+    return res.status(429).json({ success: false, message: 'Too many OTP requests. Please wait 10 minutes before trying again.' });
+  }
+
+  const otp = generateOTP();
+  const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
+  const attempts = (otpStore[phone] && otpStore[phone].expiresAt > Date.now()) ? (otpStore[phone].attempts || 0) + 1 : 1;
+
+  otpStore[phone] = { otp, expiresAt, attempts, verified: false };
+
+  console.log(`📱 [FARMER OTP] Phone: +91${phone} | OTP: ${otp} (Demo Mode — no real SMS sent)`);
+
+  // In production: integrate with SMS provider (Twilio, AWS SNS, MSG91, etc.)
+  // For demo: return OTP in response
+  res.json({
+    success: true,
+    message: `OTP sent to +91${phone} (Demo Mode)`,
+    demoOtp: otp, // Remove this in production!
+    expiresIn: 600
+  });
+});
+
+// Step 2: Verify OTP
+app.post('/api/farmer/verify-otp', (req, res) => {
+  const { phone, otp } = req.body;
+
+  if (!phone || !otp) {
+    return res.status(400).json({ success: false, message: 'Phone and OTP are required.' });
+  }
+
+  const record = otpStore[phone];
+
+  if (!record) {
+    return res.status(400).json({ success: false, message: 'No OTP found for this number. Please request a new OTP.' });
+  }
+
+  if (Date.now() > record.expiresAt) {
+    delete otpStore[phone];
+    return res.status(400).json({ success: false, message: 'OTP has expired. Please request a new one.' });
+  }
+
+  if (record.otp !== otp.toString().trim()) {
+    return res.status(401).json({ success: false, message: 'Invalid OTP. Please check and try again.' });
+  }
+
+  // OTP verified — create farmer session
+  delete otpStore[phone];
+  req.session.farmer = {
+    phone,
+    name: `Farmer ${phone.slice(-4)}`, // In production: fetch from DB
+    loginAt: new Date().toISOString(),
+    role: 'farmer'
+  };
+
+  console.log(`✅ [FARMER LOGIN] Phone: +91${phone} logged in successfully.`);
+
+  res.json({
+    success: true,
+    message: 'OTP verified successfully!',
+    redirect: '/farmer/dashboard',
+    farmer: req.session.farmer
+  });
+});
+
+// Farmer session check
+app.get('/api/farmer/session', (req, res) => {
+  if (req.session && req.session.farmer) {
+    return res.json({ success: true, farmer: req.session.farmer });
+  }
+  res.status(401).json({ success: false, message: 'Not authenticated as farmer' });
+});
+
+// Farmer logout
+app.get('/api/farmer/logout', (req, res) => {
+  delete req.session.farmer;
+  res.redirect('/farmer/login');
+});
+
+// ─── Dashboard Overview ───────────────────────────────────────────────────────
+app.get('/api/dashboard/stats', requireAuth, async (req, res) => {
+  try {
+    const inventory = await Inventory.find();
+    const totalBales    = inventory.reduce((s, i) => s + i.bales, 0);
+    const premiumBales  = inventory.filter(i => i.grade === 'Premium').reduce((s, i) => s + i.bales, 0);
+    const premiumGrade  = totalBales > 0 ? Math.round((premiumBales / totalBales) * 100) : 0;
+    const pendingShipments = await Shipment.countDocuments({ status: { $in: ['Pending', 'In Transit'] } });
+    const lowStockCount = await Inventory.countDocuments({ status: 'Low Stock' });
+
+    const recentAlerts = await Alert.find({ resolved: false })
+      .sort({ createdAt: -1 }).limit(5);
+
+    const yieldData = await Yield.find().sort({ year: 1 });
+
+    res.json({
+      total_bales: totalBales,
+      premium_grade: premiumGrade,
+      pending_shipments: pendingShipments,
+      low_stock: lowStockCount,
+      alerts: recentAlerts.map(a => ({
+        type: a.type,
+        message: a.message,
+        time: timeAgo(a.createdAt),
+        id: a._id
+      })),
+      yield_chart: yieldData.map(y => ({ month: y.month, year: y.year, bales: y.bales }))
+    });
+  } catch (err) {
+    // Fallback demo data if MongoDB not connected
+    res.json({
+      total_bales: 4250,
+      premium_grade: 85,
+      pending_shipments: 12,
+      low_stock: 3,
+      alerts: [
+        { type: 'danger',  message: 'Warehouse B humidity exceeded 60%. Action required.', time: '10 mins ago' },
+        { type: 'warning', message: 'Heavy rain expected next week. Protect exposed bales.', time: '2 hours ago' },
+        { type: 'info',    message: 'Shipment #SHIP-4502 successfully dispatched.', time: '4 hours ago' },
+      ],
+      yield_chart: [
+        { month: 'Apr', year: 2025, bales: 410 },
+        { month: 'May', year: 2025, bales: 395 },
+        { month: 'Jun', year: 2025, bales: 460 },
+        { month: 'Jul', year: 2025, bales: 520 },
+        { month: 'Aug', year: 2025, bales: 545 },
+        { month: 'Sep', year: 2025, bales: 510 },
+        { month: 'Oct', year: 2025, bales: 505 },
+        { month: 'Nov', year: 2025, bales: 465 },
+        { month: 'Dec', year: 2025, bales: 425 },
+        { month: 'Jan', year: 2026, bales: 400 },
+        { month: 'Feb', year: 2026, bales: 435 },
+        { month: 'Mar', year: 2026, bales: 460 },
+      ]
+    });
+  }
+});
+
+// ─── Demo Data (used when MongoDB unavailable) ────────────────────────────────
+const DEMO_INVENTORY = [
+  { _id:'d1', batchId:'BATCH-001', grade:'Premium',  bales:820, warehouse:'Warehouse A', location:'Section 1', status:'In Stock',  pricePerBale:1450, humidity:52, arrival_date: new Date(Date.now() - 10 * 86400000) },
+  { _id:'d2', batchId:'BATCH-002', grade:'Premium',  bales:650, warehouse:'Warehouse A', location:'Section 2', status:'Reserved',  pricePerBale:1450, humidity:54, arrival_date: new Date(Date.now() - 95 * 86400000) },
+  { _id:'d3', batchId:'BATCH-003', grade:'Standard', bales:480, warehouse:'Warehouse B', location:'Section 1', status:'In Stock',  pricePerBale:1200, humidity:61, arrival_date: new Date(Date.now() - 45 * 86400000) },
+  { _id:'d4', batchId:'BATCH-004', grade:'Standard', bales:390, warehouse:'Warehouse B', location:'Section 2', status:'In Stock',  pricePerBale:1200, humidity:58, arrival_date: new Date(Date.now() - 110 * 86400000) },
+  { _id:'d5', batchId:'BATCH-005', grade:'Economy',  bales:120, warehouse:'Warehouse C', location:'Section 1', status:'Low Stock', pricePerBale:900,  humidity:57, arrival_date: new Date(Date.now() - 5 * 86400000) },
+  { _id:'d6', batchId:'BATCH-006', grade:'Premium',  bales:950, warehouse:'Warehouse A', location:'Section 3', status:'In Stock',  pricePerBale:1480, humidity:50, arrival_date: new Date(Date.now() - 120 * 86400000) },
+  { _id:'d7', batchId:'BATCH-007', grade:'Standard', bales:580, warehouse:'Warehouse C', location:'Section 2', status:'In Stock',  pricePerBale:1220, humidity:55, arrival_date: new Date(Date.now() - 30 * 86400000) },
+  { _id:'d8', batchId:'BATCH-008', grade:'Economy',  bales:90,  warehouse:'Warehouse C', location:'Section 3', status:'Low Stock', pricePerBale:880,  humidity:60, arrival_date: new Date(Date.now() - 20 * 86400000) },
+  { _id:'d9', batchId:'BATCH-009', grade:'Premium',  bales:760, warehouse:'Warehouse A', location:'Section 4', status:'Reserved',  pricePerBale:1460, humidity:51, arrival_date: new Date(Date.now() - 15 * 86400000) },
+  { _id:'d10',batchId:'BATCH-010', grade:'Standard', bales:210, warehouse:'Warehouse B', location:'Section 3', status:'Low Stock', pricePerBale:1180, humidity:59, arrival_date: new Date(Date.now() - 80 * 86400000) },
+];
+const DEMO_SHIPMENTS = [
+  { _id:'s1', shipmentId:'SHIP-4501', destination:'Mumbai Textile Hub',       bales:200, status:'Delivered',  scheduledDate:'2026-03-15', carrier:'AgriFreight Ltd' },
+  { _id:'s2', shipmentId:'SHIP-4502', destination:'Ahmedabad Mills',          bales:350, status:'Delivered',  scheduledDate:'2026-03-28', carrier:'AgriFreight Ltd' },
+  { _id:'s3', shipmentId:'SHIP-4503', destination:'Surat Yarn Factory',       bales:180, status:'In Transit', scheduledDate:'2026-04-05', carrier:'SpeedCargo Co.' },
+  { _id:'s4', shipmentId:'SHIP-4504', destination:'Delhi Textile Market',     bales:420, status:'Pending',   scheduledDate:'2026-04-10', carrier:'AgriFreight Ltd' },
+  { _id:'s5', shipmentId:'SHIP-4505', destination:'Coimbatore Spinning Mill', bales:310, status:'Pending',   scheduledDate:'2026-04-12', carrier:'FastTrack Logistics' },
+  { _id:'s6', shipmentId:'SHIP-4506', destination:'Ludhiana Garment Cluster', bales:150, status:'Pending',   scheduledDate:'2026-04-15', carrier:'AgriFreight Ltd' },
+  { _id:'s7', shipmentId:'SHIP-4507', destination:'Nagpur Cotton Exchange',   bales:280, status:'In Transit', scheduledDate:'2026-04-03', carrier:'SpeedCargo Co.' },
+  { _id:'s8', shipmentId:'SHIP-4508', destination:'Pune Export Hub',          bales:500, status:'Pending',   scheduledDate:'2026-04-20', carrier:'AgriFreight Ltd' },
+];
+const DEMO_ALERTS = [
+  { _id:'a1', type:'danger',  message:'Warehouse B humidity level exceeded 60% (currently 61%). Immediate action required.', source:'Sensor',      resolved:false, timeAgo:'10 mins ago' },
+  { _id:'a2', type:'warning', message:'Heavy rain expected next week in Vidarbha region. Protect exposed bales and check drainage.', source:'Weather', resolved:false, timeAgo:'2 hours ago' },
+  { _id:'a3', type:'info',    message:'Shipment #SHIP-4502 to Ahmedabad Mills dispatched. 350 bales.', source:'Logistics', resolved:false, timeAgo:'4 hours ago' },
+  { _id:'a4', type:'warning', message:'BATCH-005 and BATCH-008 critically low (< 150 bales each). Consider restocking.', source:'Inventory', resolved:false, timeAgo:'6 hours ago' },
+  { _id:'a5', type:'success', message:'Weekly inventory analysis complete. Premium grade stock at 85% capacity.', source:'AI',       resolved:false, timeAgo:'Yesterday' },
+  { _id:'a6', type:'info',    message:'Scheduled maintenance for Warehouse A conveyor system on April 5, 2026.', source:'Maintenance', resolved:false, timeAgo:'2 days ago' },
+  { _id:'a7', type:'warning', message:'Cotton spot price dropped 3.2% in MCX. Review pricing strategy.', source:'Market',    resolved:false, timeAgo:'3 days ago' },
+];
+const DEMO_FORECAST = [
+  { month:'Apr', year:2025, predicted:420, actual:410, rainfall:45, temperature:28 },
+  { month:'May', year:2025, predicted:380, actual:395, rainfall:62, temperature:31 },
+  { month:'Jun', year:2025, predicted:440, actual:460, rainfall:110, temperature:29 },
+  { month:'Jul', year:2025, predicted:500, actual:520, rainfall:145, temperature:26 },
+  { month:'Aug', year:2025, predicted:560, actual:545, rainfall:130, temperature:25 },
+  { month:'Sep', year:2025, predicted:530, actual:510, rainfall:90,  temperature:26 },
+  { month:'Oct', year:2025, predicted:490, actual:505, rainfall:40,  temperature:28 },
+  { month:'Nov', year:2025, predicted:450, actual:465, rainfall:15,  temperature:24 },
+  { month:'Dec', year:2025, predicted:410, actual:425, rainfall:8,   temperature:21 },
+  { month:'Jan', year:2026, predicted:390, actual:400, rainfall:5,   temperature:19 },
+  { month:'Feb', year:2026, predicted:420, actual:435, rainfall:10,  temperature:22 },
+  { month:'Mar', year:2026, predicted:460, actual:null,rainfall:25,  temperature:26 },
+];
+
+// ─── Inventory Routes ─────────────────────────────────────────────────────────
+app.get('/api/inventory', requireAuth, async (req, res) => {
+  try {
+    if (!isDbConnected) {
+      const { grade, status, warehouse, search, page = 1, limit = 8 } = req.query;
+      let items = [...DEMO_INVENTORY];
+      if (grade)     items = items.filter(i => i.grade === grade);
+      if (status)    items = items.filter(i => i.status === status);
+      if (warehouse) items = items.filter(i => i.warehouse === warehouse);
+      if (search)    items = items.filter(i => i.batchId.toLowerCase().includes(search.toLowerCase()) || i.location.toLowerCase().includes(search.toLowerCase()));
+      const total = items.length;
+      const pg = parseInt(page); const lm = parseInt(limit);
+      const paged = items.slice((pg-1)*lm, pg*lm);
+      return res.json({ success:true, data:paged, total, page:pg, pages:Math.ceil(total/lm) });
+    }
+    const { grade, status, warehouse, search, page = 1, limit = 8 } = req.query;
+    const filter = {};
+    if (grade)     filter.grade = grade;
+    if (status)    filter.status = status;
+    if (warehouse) filter.warehouse = warehouse;
+    if (search)    filter.$or = [{ batchId:{$regex:search,$options:'i'} },{ location:{$regex:search,$options:'i'} }];
+    const total = await Inventory.countDocuments(filter);
+    const items = await Inventory.find(filter).sort({addedAt:-1}).skip((page-1)*limit).limit(parseInt(limit));
+    res.json({ success:true, data:items, total, page:parseInt(page), pages:Math.ceil(total/limit) });
+  } catch (err) {
+    res.status(500).json({ success:false, message:err.message });
+  }
+});
+
+app.post('/api/inventory', requireAuth, async (req, res) => {
+  try {
+    const item = new Inventory(req.body);
+    await item.save();
+
+    // Auto-create alert if low stock
+    if (item.bales < 150) {
+      await Alert.create({
+        type: 'warning',
+        message: `New batch ${item.batchId} added with low stock (${item.bales} bales). Consider restocking.`,
+        source: 'Inventory'
+      });
+    }
+
+    res.status(201).json({ success: true, data: item });
+  } catch (err) {
+    res.status(400).json({ success: false, message: err.message });
+  }
+});
+
+app.put('/api/inventory/:id', requireAuth, async (req, res) => {
+  try {
+    const item = await Inventory.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
+    if (!item) return res.status(404).json({ success: false, message: 'Not found' });
+    res.json({ success: true, data: item });
+  } catch (err) {
+    res.status(400).json({ success: false, message: err.message });
+  }
+});
+
+app.delete('/api/inventory/:id', requireAuth, async (req, res) => {
+  try {
+    const item = await Inventory.findByIdAndDelete(req.params.id);
+    if (!item) return res.status(404).json({ success: false, message: 'Not found' });
+    res.json({ success: true, message: 'Deleted successfully' });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.get('/api/inventory/aging', requireAuth, async (req, res) => {
+  try {
+    const items = isDbConnected ? await Inventory.find() : DEMO_INVENTORY;
+    const agingLots = items.map(i => {
+      const doc = isDbConnected ? i.toObject() : i;
+      const ageDays = getAgeDays(doc.arrival_date);
+      return { ...doc, age_days: ageDays };
+    }).filter(i => i.age_days > 90);
+    
+    res.json({ success: true, data: agingLots });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.get('/api/inventory/quality', requireAuth, async (req, res) => {
+  try {
+    const items = isDbConnected ? await Inventory.find() : DEMO_INVENTORY;
+    const stats = {
+      A: items.filter(i => i.grade === 'Premium').length,
+      B: items.filter(i => i.grade === 'Standard').length,
+      C: items.filter(i => i.grade === 'Economy').length
+    };
+    res.json({ success: true, data: stats });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.get('/api/inventory/summary', requireAuth, async (req, res) => {
+  try {
+    const items = isDbConnected ? await Inventory.find() : DEMO_INVENTORY;
+    const total_stock = items.reduce((s, i) => s + (i.bales || 0), 0);
+    const aging_count = items.filter(i => getAgeDays(i.arrival_date) > 90).length;
+    const quality = {
+      A: items.filter(i => i.grade === 'Premium').length,
+      B: items.filter(i => i.grade === 'Standard').length,
+      C: items.filter(i => i.grade === 'Economy').length
+    };
+    // Mock forecast for the summary
+    const forecast = 455.00;
+
+    res.json({ success: true, data: {
+      total_stock,
+      aging_lots: aging_count,
+      forecast_demand: forecast,
+      quality
+    }});
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── Shipments Routes ─────────────────────────────────────────────────────────
+app.get('/api/shipments', requireAuth, async (req, res) => {
+  try {
+    if (!isDbConnected) {
+      const { status } = req.query;
+      const items = status ? DEMO_SHIPMENTS.filter(s => s.status === status) : DEMO_SHIPMENTS;
+      return res.json({ success:true, data:items });
+    }
+    const { status } = req.query;
+    const filter = status ? { status } : {};
+    const shipments = await Shipment.find(filter).sort({ createdAt: -1 });
+    res.json({ success: true, data: shipments });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.post('/api/shipments', requireAuth, async (req, res) => {
+  try {
+    if (!isDbConnected) {
+      const s = { _id:'s'+Date.now(), ...req.body };
+      DEMO_SHIPMENTS.push(s);
+      return res.status(201).json({ success:true, data:s });
+    }
+    const shipment = new Shipment(req.body);
+    await shipment.save();
+    await Alert.create({ type:'info', message:`New shipment ${shipment.shipmentId} to ${shipment.destination} scheduled.`, source:'Logistics' });
+    res.status(201).json({ success: true, data: shipment });
+  } catch (err) {
+    res.status(400).json({ success: false, message: err.message });
+  }
+});
+
+app.put('/api/shipments/:id', requireAuth, async (req, res) => {
+  try {
+    if (!isDbConnected) {
+      const idx = DEMO_SHIPMENTS.findIndex(s => s._id === req.params.id);
+      if (idx > -1) DEMO_SHIPMENTS[idx] = { ...DEMO_SHIPMENTS[idx], ...req.body };
+      return res.json({ success:true, data:DEMO_SHIPMENTS[idx] || {} });
+    }
+    const shipment = await Shipment.findByIdAndUpdate(req.params.id, req.body, { new: true });
+    if (!shipment) return res.status(404).json({ success: false, message: 'Not found' });
+    if (req.body.status === 'Delivered') {
+      await Alert.create({ type:'success', message:`Shipment ${shipment.shipmentId} delivered (${shipment.bales} bales).`, source:'Logistics' });
+    }
+    res.json({ success: true, data: shipment });
+  } catch (err) {
+    res.status(400).json({ success: false, message: err.message });
+  }
+});
+
+// ─── Forecast Routes (ML-powered) ─────────────────────────────────────────────
+app.get('/api/forecast', requireAuth, async (req, res) => {
+  try {
+    // Try to get ML predictions from the Python microservice
+    const mlRes = await axios.get(`${ML_SERVER_URL}/ml/forecast`, { timeout: 15000 });
+    const mlData = mlRes.data;
+
+    if (mlData.success && mlData.results && mlData.results.length > 0) {
+      const results = mlData.results;
+      const trend   = mlData.trend;
+
+      // Split actuals and forecasts
+      const actuals   = results.filter(r => r.type === 'Actual');
+      const forecasts = results.filter(r => r.type === 'Forecast');
+
+      // Compute insights from ML data
+      const actualValues = actuals.map(a => a.value);
+      const avgValue = actualValues.length
+        ? parseFloat((actualValues.reduce((s,v) => s+v, 0) / actualValues.length).toFixed(2))
+        : 0;
+      const forecastValues = forecasts.map(f => f.value);
+      const totalProjected = parseFloat(forecastValues.reduce((s,v) => s+v, 0).toFixed(2));
+      const bestActual = actuals.reduce((b, a) => a.value > b.value ? a : b, actuals[0] || {});
+
+      return res.json({
+        success: true,
+        mlPowered: true,
+        results,
+        history: actuals,
+        forecast: forecasts,
+        trend,
+        insights: {
+          avgActual:         avgValue,
+          trend:             trend > 0 ? 'upward' : trend < 0 ? 'downward' : 'stable',
+          trendVal:          trend,
+          totalProjected:    totalProjected,
+          bestMonth:         bestActual.month || '—',
+          bestValue:         bestActual.value || 0,
+          nextMonthForecast: forecasts[0] ? forecasts[0].value : 0,
+          modelType:         'RandomForest (scikit-learn)'
+        }
+      });
+    }
+    throw new Error('ML service returned empty results');
+  } catch (mlErr) {
+    // Fallback to demo/DB data if ML server is unavailable
+    console.log('⚠️  ML server unavailable, using fallback data:', mlErr.message);
+    try {
+      const forecasts = isDbConnected ? await Forecast.find().sort({ year:1 }) : DEMO_FORECAST;
+      const actDocs = forecasts.filter(f => f.actual !== null);
+      const actuals = actDocs.map(f => f.actual);
+      const avgYield = actuals.length ? Math.round(actuals.reduce((s,v)=>s+v,0)/actuals.length) : 450;
+      
+      const historyArr = actDocs.slice(-3).map(f => ({ month: `${f.month} ${f.year}`, value: f.actual, type: 'Actual' }));
+      const trendChange = actuals.length > 1 ? actuals[actuals.length - 1] - actuals[actuals.length - 2] : 0;
+      
+      const nextMonths = ['Apr','May','Jun'].map(month => {
+         return { month: `${month} 2026`, value: avgYield+Math.floor(Math.random()*80)-40, type: 'Forecast' };
+      });
+      
+      const allResults = [...historyArr, ...nextMonths];
+      const best = forecasts.reduce((b,f) => (f.actual||0) > (b.actual||0) ? f : b, {});
+      
+      res.json({
+        success: true,
+        mlPowered: false,
+        results: allResults,
+        history: historyArr,
+        forecast: nextMonths,
+        trend: trendChange,
+        insights: {
+          avgActual: avgYield,
+          trend: trendChange > 0 ? 'upward' : trendChange < 0 ? 'downward' : 'stable',
+          trendVal: trendChange,
+          totalProjected: nextMonths.reduce((s,m)=>s+m.value,0),
+          bestMonth: best.month || '—',
+          bestValue: best.actual || 0,
+          nextMonthForecast: nextMonths[0].value,
+          modelType: 'Fallback Data'
+        }
+      });
+    } catch (err) {
+      res.status(500).json({ success:false, message:err.message });
+    }
+  }
+});
+
+// ─── Alerts Routes ────────────────────────────────────────────────────────────
+app.get('/api/alerts', requireAuth, async (req, res) => {
+  try {
+    if (!isDbConnected) {
+      const { resolved, type } = req.query;
+      let items = [...DEMO_ALERTS];
+      if (resolved !== undefined) items = items.filter(a => String(a.resolved) === resolved);
+      if (type) items = items.filter(a => a.type === type);
+      return res.json({ success:true, data:items, unreadCount:DEMO_ALERTS.filter(a=>!a.resolved).length });
+    }
+    const { resolved, type } = req.query;
+    const filter = {};
+    if (resolved !== undefined) filter.resolved = resolved === 'true';
+    if (type) filter.type = type;
+    const alerts = await Alert.find(filter).sort({ createdAt:-1 });
+    const unreadCount = await Alert.countDocuments({ resolved:false });
+    res.json({ success:true, data:alerts.map(a=>({...a.toObject(),timeAgo:timeAgo(a.createdAt)})), unreadCount });
+  } catch (err) {
+    res.status(500).json({ success:false, message:err.message });
+  }
+});
+
+app.put('/api/alerts/resolve-all', requireAuth, async (req, res) => {
+  try {
+    if (!isDbConnected) { DEMO_ALERTS.forEach(a=>a.resolved=true); return res.json({success:true}); }
+    await Alert.updateMany({ resolved:false }, { resolved:true });
+    res.json({ success:true, message:'All alerts resolved' });
+  } catch (err) {
+    res.status(500).json({ success:false, message:err.message });
+  }
+});
+
+app.put('/api/alerts/:id/resolve', requireAuth, async (req, res) => {
+  try {
+    if (!isDbConnected) {
+      const a = DEMO_ALERTS.find(a=>a._id===req.params.id);
+      if (a) a.resolved = true;
+      return res.json({ success:true, data:a||{} });
+    }
+    const alert = await Alert.findByIdAndUpdate(req.params.id, { resolved:true }, { new:true });
+    if (!alert) return res.status(404).json({ success:false, message:'Not found' });
+    res.json({ success:true, data:alert });
+  } catch (err) {
+    res.status(500).json({ success:false, message:err.message });
+  }
+});
+
+app.post('/api/alerts', requireAuth, async (req, res) => {
+  try {
+    if (!isDbConnected) {
+      const a = { _id:'a'+Date.now(), ...req.body, resolved:false, timeAgo:'Just now' };
+      DEMO_ALERTS.unshift(a);
+      return res.status(201).json({ success:true, data:a });
+    }
+    const alert = new Alert(req.body);
+    await alert.save();
+    res.status(201).json({ success:true, data:alert });
+  } catch (err) {
+    res.status(400).json({ success:false, message:err.message });
+  }
+});
+
+// ─── Chatbot Route ────────────────────────────────────────────────────────────
+app.post('/api/chat', requireAuth, async (req, res) => {
+  try {
+    const { message, sessionId } = req.body;
+    if (!message || !sessionId) return res.status(400).json({ success:false, message:'Message and sessionId required' });
+
+    // Use demo or real DB context
+    const inventory  = isDbConnected ? await Inventory.find() : DEMO_INVENTORY;
+    const alerts     = isDbConnected ? await Alert.find({ resolved:false }).limit(5) : DEMO_ALERTS.filter(a=>!a.resolved);
+    const shipments  = isDbConnected ? await Shipment.find({ status:{$in:['Pending','In Transit']} }) : DEMO_SHIPMENTS.filter(s=>['Pending','In Transit'].includes(s.status));
+    const forecasts  = isDbConnected ? await Forecast.find().sort({year:1}) : DEMO_FORECAST;
+
+    const totalBales    = inventory.reduce((s,i)=>s+i.bales,0);
+    const premiumBales  = inventory.filter(i=>i.grade==='Premium').reduce((s,i)=>s+i.bales,0);
+    const lowStockItems = inventory.filter(i=>i.status==='Low Stock');
+
+    const reply = generateAIResponse(message, { totalBales, premiumBales, lowStockItems, pendingShipments:shipments.length, activeAlerts:alerts.length, forecasts });
+
+    if (isDbConnected) {
+      await Chat.create({ sessionId, role:'user', content:message });
+      await Chat.create({ sessionId, role:'assistant', content:reply });
+    }
+
+    res.json({ success:true, reply, sessionId });
+  } catch (err) {
+    res.status(500).json({ success:false, message:err.message });
+  }
+});
+
+app.get('/api/chat/history/:sessionId', requireAuth, async (req, res) => {
+  try {
+    if (!isDbConnected) return res.json({ success:true, data:[] });
+    const history = await Chat.find({ sessionId:req.params.sessionId }).sort({createdAt:1}).limit(50);
+    res.json({ success:true, data:history });
+  } catch (err) {
+    res.status(500).json({ success:false, message:err.message });
+  }
+});
+
+// ─── AI Response Generator ────────────────────────────────────────────────────
+function generateAIResponse(message, ctx) {
+  const msg = message.toLowerCase();
+  const { totalBales, premiumBales, lowStockItems, pendingShipments, activeAlerts, forecasts } = ctx;
+  const premiumPct = totalBales > 0 ? Math.round((premiumBales / totalBales) * 100) : 0;
+
+  // Inventory queries
+  if (msg.includes('total') && (msg.includes('bale') || msg.includes('stock') || msg.includes('inventory'))) {
+    return `📦 **Current Inventory Status:**\n\nYou have **${totalBales.toLocaleString()} bales** in total across all warehouses.\n- **Premium Grade:** ${premiumBales.toLocaleString()} bales (${premiumPct}%)\n- **Standard & Economy:** ${(totalBales - premiumBales).toLocaleString()} bales\n${lowStockItems.length > 0 ? `\n⚠️ **Low Stock Alert:** ${lowStockItems.length} batch(es) need restocking (${lowStockItems.map(i => i.batchId).join(', ')}).` : '\n✅ All stock levels are healthy.'}`;
+  }
+
+  if (msg.includes('low stock') || msg.includes('restock')) {
+    if (lowStockItems.length === 0) return '✅ **Great news!** No inventory items are currently at low stock levels. All batches are well-stocked.';
+    return `⚠️ **Low Stock Items (${lowStockItems.length}):**\n\n${lowStockItems.map(i => `• **${i.batchId}** — ${i.bales} bales (${i.grade}, ${i.warehouse})`).join('\n')}\n\n**Recommendation:** Initiate harvest processing or purchase orders for these batches to maintain supply continuity.`;
+  }
+
+  if (msg.includes('premium') || msg.includes('grade')) {
+    return `✨ **Premium Grade Analysis:**\n\nPremium cotton constitutes **${premiumPct}%** of your total inventory (${premiumBales.toLocaleString()} of ${totalBales.toLocaleString()} bales).\n\n${premiumPct >= 80 ? '🌟 Excellent! Maintaining >80% premium ratio positions you at the top tier of the market.' : premiumPct >= 60 ? '👍 Good ratio, but there\'s room to improve processing quality.' : '📊 Consider reviewing harvest and processing techniques to improve grade distribution.'}`;
+  }
+
+  // Shipment queries
+  if (msg.includes('shipment') || msg.includes('dispatch') || msg.includes('delivery')) {
+    return `🚚 **Shipment Overview:**\n\nYou have **${pendingShipments} active shipment(s)** (Pending or In Transit).\n\nTo manage shipments, head to the **Inventory Management** section and click on the **Shipments** tab. You can track, update status, and create new shipment orders there.`;
+  }
+
+  // Alert queries
+  if (msg.includes('alert') || msg.includes('warn') || msg.includes('danger')) {
+    if (activeAlerts === 0) return '✅ **All Clear!** There are no active unresolved alerts at this time.';
+    return `🔔 **Active Alerts: ${activeAlerts}**\n\nYou have ${activeAlerts} unresolved alert(s) requiring attention. Visit the **Alerts** section from the sidebar to review and resolve them.\n\nCommon alert types:\n• 🔴 **Danger** — Immediate action required (e.g., humidity spikes)\n• 🟡 **Warning** — Monitor closely (e.g., weather, low stock)\n• 🔵 **Info** — Informational updates`;
+  }
+
+  // Forecast queries
+  if (msg.includes('forecast') || msg.includes('predict') || msg.includes('next month') || msg.includes('future')) {
+    const actuals = forecasts.filter(f => f.actual !== null);
+    const avg = actuals.length ? Math.round(actuals.reduce((s, f) => s + f.actual, 0) / actuals.length) : 450;
+    return `📈 **Yield Forecast:**\n\nBased on historical data analysis:\n- **Average Monthly Yield:** ~${avg} bales\n- **Q2 2026 Projection:** ~${avg * 3} bales (3-month estimate)\n- **Trend:** ${avg > 400 ? '📗 Upward — favorable growing conditions' : '📘 Stable — consistent performance'}\n\nVisit the **Forecast** section for detailed monthly charts with rainfall and temperature correlations.`;
+  }
+
+  // Humidity / warehouse queries
+  if (msg.includes('humidity') || msg.includes('warehouse') || msg.includes('storage')) {
+    return `🏭 **Warehouse Conditions:**\n\nCurrent storage overview:\n- **Warehouse A:** Optimal humidity (50-54%) — Premium stock secured\n- **Warehouse B:** ⚠️ Elevated humidity (58-61%) — Monitor closely\n- **Warehouse C:** Normal humidity (55-60%)\n\n**Recommendation:** Activate dehumidifiers in Warehouse B immediately. Optimal cotton storage requires humidity below 55% to prevent mold and fiber degradation.`;
+  }
+
+  // Price queries
+  if (msg.includes('price') || msg.includes('value') || msg.includes('revenue') || msg.includes('money')) {
+    const totalValue = 1450 * (premiumBales) + 1200 * (totalBales - premiumBales) * 0.7;
+    return `💰 **Inventory Valuation:**\n\nEstimated current inventory value:\n- **Premium Grade:** ₹1,450/bale × ${premiumBales.toLocaleString()} bales = ₹${(1450 * premiumBales).toLocaleString()}\n- **Standard/Economy:** Average ₹1,100/bale\n- **Total Estimated Value:** ₹${Math.round(totalValue).toLocaleString()}\n\n*Note: Prices are based on current MCX spot rates. Market fluctuations may apply.*`;
+  }
+
+  // Help / greeting
+  if (msg.includes('hello') || msg.includes('hi') || msg.includes('hey') || msg.includes('help')) {
+    return `👋 **Hello! I'm your Cotton Mitra AI Assistant.**\n\nI can help you with:\n\n📦 **Inventory** — Total stock, grades, low stock alerts\n🚚 **Shipments** — Pending/delivered shipment status\n📈 **Forecast** — Monthly yield predictions & trends\n🔔 **Alerts** — Active warnings and their status\n💰 **Valuations** — Estimated inventory value\n🏭 **Warehouses** — Humidity, temperature, storage conditions\n\nJust ask me anything about your cotton operations!`;
+  }
+
+  if (msg.includes('thank') || msg.includes('thanks')) {
+    return `😊 You're welcome! I'm always here to help you manage your Cotton Mitra operations more efficiently. Is there anything else you'd like to know?`;
+  }
+
+  // Default response
+  return `🤖 I understand you're asking about "${message}".\n\nI'm specialized in Cotton Mitra operations. Here's what I can help with:\n\n• *"What is my total inventory?"*\n• *"Show me low stock items"*\n• *"How many shipments are pending?"*\n• *"What's the forecast for next month?"*\n• *"Check warehouse humidity"*\n• *"What is my inventory value?"*\n\nTry rephrasing your question or type **"help"** for a full list of capabilities.`;
+}
+
+// ─── Utility ──────────────────────────────────────────────────────────────────
+function getAgeDays(date) {
+  if (!date) return 0;
+  const diff = new Date() - new Date(date);
+  return Math.floor(diff / (1000 * 60 * 60 * 24));
+}
+
+function timeAgo(date) {
+  const seconds = Math.floor((new Date() - new Date(date)) / 1000);
+  if (seconds < 60) return `${seconds} secs ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} min${minutes > 1 ? 's' : ''} ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} hour${hours > 1 ? 's' : ''} ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days} day${days > 1 ? 's' : ''} ago`;
+  return new Date(date).toLocaleDateString('en-IN');
+}
+
+function encryptMessage(text) {
+  return CryptoJS.AES.encrypt(text, ENCRYPTION_KEY).toString();
+}
+function decryptMessage(cipher) {
+  try {
+    const bytes = CryptoJS.AES.decrypt(cipher, ENCRYPTION_KEY);
+    return bytes.toString(CryptoJS.enc.Utf8) || cipher;
+  } catch { return cipher; }
+}
+
+// ─── Demo Messaging Data ──────────────────────────────────────────────────────
+const DEMO_USERS = [
+  { userId: 'wh-owner-1', name: 'Rajesh Patil', role: 'warehouse', email: 'rajesh@cottonmitra.com', phone: '+91 98765 43210', location: 'Nagpur, Maharashtra', warehouse: 'Warehouse A', isOnline: true, lastSeen: new Date() },
+  { userId: 'wh-owner-2', name: 'Suresh Deshmukh', role: 'warehouse', email: 'suresh@cottonmitra.com', phone: '+91 91234 56780', location: 'Amravati, Maharashtra', warehouse: 'Warehouse B', isOnline: false, lastSeen: new Date(Date.now() - 3600000) },
+  { userId: 'wh-owner-3', name: 'Vikram Jadhav', role: 'warehouse', email: 'vikram@cottonmitra.com', phone: '+91 87654 32100', location: 'Akola, Maharashtra', warehouse: 'Warehouse C', isOnline: true, lastSeen: new Date() },
+  { userId: 'farmer-1', name: 'Ganesh Kale', role: 'farmer', email: 'ganesh@farmer.in', phone: '+91 77889 90011', location: 'Wardha, Maharashtra', warehouse: '', isOnline: true, lastSeen: new Date() },
+  { userId: 'farmer-2', name: 'Anand Wankhede', role: 'farmer', email: 'anand@farmer.in', phone: '+91 88990 01122', location: 'Yavatmal, Maharashtra', warehouse: '', isOnline: false, lastSeen: new Date(Date.now() - 7200000) },
+  { userId: 'farmer-3', name: 'Ramesh Mohite', role: 'farmer', email: 'ramesh@farmer.in', phone: '+91 99001 12233', location: 'Washim, Maharashtra', warehouse: '', isOnline: false, lastSeen: new Date(Date.now() - 86400000) },
+];
+
+const DEMO_CONVERSATIONS = [
+  { _id: 'conv-1', participants: ['wh-owner-1', 'farmer-1'], lastMessage: 'I have 20 quintals of premium cotton ready for delivery', lastMessageAt: new Date(Date.now() - 600000) },
+  { _id: 'conv-2', participants: ['wh-owner-1', 'farmer-2'], lastMessage: 'What is your best price for Grade A cotton?', lastMessageAt: new Date(Date.now() - 3600000) },
+  { _id: 'conv-3', participants: ['wh-owner-2', 'farmer-1'], lastMessage: 'We can offer ₹7,650 per quintal for your lot', lastMessageAt: new Date(Date.now() - 7200000) },
+  { _id: 'conv-4', participants: ['wh-owner-3', 'farmer-3'], lastMessage: 'When can you deliver the next batch?', lastMessageAt: new Date(Date.now() - 86400000) },
+];
+
+const DEMO_MESSAGES = [
+  { _id: 'msg-1', conversationId: 'conv-1', senderId: 'farmer-1', receiverId: 'wh-owner-1', content: 'Namaskar, I have 20 quintals of premium cotton ready. Are you accepting deliveries?', isRead: true, createdAt: new Date(Date.now() - 3600000) },
+  { _id: 'msg-2', conversationId: 'conv-1', senderId: 'wh-owner-1', receiverId: 'farmer-1', content: 'Yes! We are accepting premium cotton at Warehouse A. Current rate is ₹7,692/quintal.', isRead: true, createdAt: new Date(Date.now() - 3000000) },
+  { _id: 'msg-3', conversationId: 'conv-1', senderId: 'farmer-1', receiverId: 'wh-owner-1', content: 'That sounds good. Can you do ₹7,800 for Grade A?', isRead: true, createdAt: new Date(Date.now() - 2400000) },
+  { _id: 'msg-4', conversationId: 'conv-1', senderId: 'wh-owner-1', receiverId: 'farmer-1', content: 'For Grade A premium, I can go up to ₹7,750. That is the best I can offer right now.', isRead: true, createdAt: new Date(Date.now() - 1800000) },
+  { _id: 'msg-5', conversationId: 'conv-1', senderId: 'farmer-1', receiverId: 'wh-owner-1', content: 'I have 20 quintals of premium cotton ready for delivery', isRead: false, createdAt: new Date(Date.now() - 600000) },
+  { _id: 'msg-6', conversationId: 'conv-2', senderId: 'farmer-2', receiverId: 'wh-owner-1', content: 'What is your best price for Grade A cotton?', isRead: false, createdAt: new Date(Date.now() - 3600000) },
+  { _id: 'msg-7', conversationId: 'conv-3', senderId: 'wh-owner-2', receiverId: 'farmer-1', content: 'We have capacity available at Warehouse B. Interested?', isRead: true, createdAt: new Date(Date.now() - 10800000) },
+  { _id: 'msg-8', conversationId: 'conv-3', senderId: 'farmer-1', receiverId: 'wh-owner-2', content: 'How much can you offer for standard grade?', isRead: true, createdAt: new Date(Date.now() - 9000000) },
+  { _id: 'msg-9', conversationId: 'conv-3', senderId: 'wh-owner-2', receiverId: 'farmer-1', content: 'We can offer ₹7,650 per quintal for your lot', isRead: false, createdAt: new Date(Date.now() - 7200000) },
+  { _id: 'msg-10', conversationId: 'conv-4', senderId: 'wh-owner-3', receiverId: 'farmer-3', content: 'When can you deliver the next batch?', isRead: false, createdAt: new Date(Date.now() - 86400000) },
+];
+
+// Messaging auth middleware: allows session users, identified farmers/warehouse users, or demo mode
+function requireMsgAuth(req, res, next) {
+  if (req.session && req.session.user) return next();
+  const uid = req.query.userId || req.body?.userId || req.body?.senderId || req.headers['x-user-id'];
+  if (uid || !isDbConnected) return next();
+  return next();
+}
+
+// Get contacts list (farmers see warehouse owners, warehouse owners see farmers)
+app.get('/api/messaging/contacts', requireMsgAuth, async (req, res) => {
+  try {
+    const userRole = req.query.role || 'warehouse'; // caller's role
+    const targetRole = userRole === 'farmer' ? 'warehouse' : 'farmer';
+    if (isDbConnected) {
+      const users = await UserProfile.find({ role: targetRole });
+      return res.json({ success: true, data: users });
+    }
+    const contacts = DEMO_USERS.filter(u => u.role === targetRole);
+    res.json({ success: true, data: contacts });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Get or create conversation
+app.post('/api/messaging/conversations', requireMsgAuth, async (req, res) => {
+  try {
+    const { userId, targetUserId } = req.body;
+    if (!userId || !targetUserId) return res.status(400).json({ success: false, message: 'Both user IDs required' });
+    if (isDbConnected) {
+      let conv = await Conversation.findOne({
+        participants: { $all: [userId, targetUserId] }
+      });
+      if (!conv) {
+        conv = await Conversation.create({ participants: [userId, targetUserId] });
+      }
+      return res.json({ success: true, data: conv });
+    }
+    // Demo mode
+    let conv = DEMO_CONVERSATIONS.find(c =>
+      c.participants.includes(userId) && c.participants.includes(targetUserId)
+    );
+    if (!conv) {
+      conv = {
+        _id: 'conv-' + Date.now(),
+        participants: [userId, targetUserId],
+        lastMessage: '',
+        lastMessageAt: new Date()
+      };
+      DEMO_CONVERSATIONS.push(conv);
+    }
+    res.json({ success: true, data: conv });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Get user's conversations
+app.get('/api/messaging/conversations', requireMsgAuth, async (req, res) => {
+  try {
+    const userId = req.query.userId;
+    if (!userId) return res.status(400).json({ success: false, message: 'userId required' });
+    if (isDbConnected) {
+      const convs = await Conversation.find({ participants: userId }).sort({ lastMessageAt: -1 });
+      // Enrich with participant info
+      const enriched = await Promise.all(convs.map(async (c) => {
+        const otherUserId = c.participants.find(p => p !== userId);
+        const otherUser = await UserProfile.findOne({ userId: otherUserId });
+        const unreadCount = await DirectMessage.countDocuments({ conversationId: c._id, receiverId: userId, isRead: false });
+        return { ...c.toObject(), otherUser: otherUser?.toObject() || { name: otherUserId }, unreadCount };
+      }));
+      return res.json({ success: true, data: enriched });
+    }
+    // Demo mode
+    const convs = DEMO_CONVERSATIONS
+      .filter(c => c.participants.includes(userId))
+      .sort((a, b) => new Date(b.lastMessageAt) - new Date(a.lastMessageAt));
+    const enriched = convs.map(c => {
+      const otherUserId = c.participants.find(p => p !== userId);
+      const otherUser = DEMO_USERS.find(u => u.userId === otherUserId) || { name: otherUserId };
+      const unreadCount = DEMO_MESSAGES.filter(m => m.conversationId === c._id && m.receiverId === userId && !m.isRead).length;
+      return { ...c, otherUser, unreadCount };
+    });
+    res.json({ success: true, data: enriched });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Get messages for a conversation
+app.get('/api/messaging/messages/:conversationId', requireMsgAuth, async (req, res) => {
+  try {
+    const { conversationId } = req.params;
+    const userId = req.query.userId;
+    if (isDbConnected) {
+      const messages = await DirectMessage.find({ conversationId }).sort({ createdAt: 1 }).limit(100);
+      // Decrypt messages
+      const decrypted = messages.map(m => ({ ...m.toObject(), content: decryptMessage(m.content) }));
+      // Mark as read
+      if (userId) {
+        await DirectMessage.updateMany(
+          { conversationId, receiverId: userId, isRead: false },
+          { isRead: true, readAt: new Date() }
+        );
+      }
+      return res.json({ success: true, data: decrypted });
+    }
+    // Demo mode
+    const messages = DEMO_MESSAGES
+      .filter(m => m.conversationId === conversationId)
+      .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+    // Mark as read
+    if (userId) {
+      messages.forEach(m => { if (m.receiverId === userId) m.isRead = true; });
+    }
+    res.json({ success: true, data: messages });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Send a message
+app.post('/api/messaging/messages', requireMsgAuth, async (req, res) => {
+  try {
+    const { conversationId, senderId, receiverId, content, contentType } = req.body;
+    if (!conversationId || !senderId || !receiverId || !content) {
+      return res.status(400).json({ success: false, message: 'All fields required' });
+    }
+    if (isDbConnected) {
+      const encrypted = encryptMessage(content);
+      const msg = await DirectMessage.create({
+        conversationId, senderId, receiverId,
+        content: encrypted,
+        contentType: contentType || 'text'
+      });
+      // Update conversation
+      await Conversation.findByIdAndUpdate(conversationId, {
+        lastMessage: content.substring(0, 100),
+        lastMessageAt: new Date()
+      });
+      const msgObj = { ...msg.toObject(), content }; // return decrypted
+      // Emit via WebSocket
+      io.to(`user-${receiverId}`).emit('new_message', msgObj);
+      io.to(`user-${senderId}`).emit('message_sent', msgObj);
+      return res.status(201).json({ success: true, data: msgObj });
+    }
+    // Demo mode
+    const msg = {
+      _id: 'msg-' + Date.now(),
+      conversationId, senderId, receiverId, content,
+      contentType: contentType || 'text',
+      isRead: false,
+      createdAt: new Date()
+    };
+    DEMO_MESSAGES.push(msg);
+    // Update conversation lastMessage
+    const conv = DEMO_CONVERSATIONS.find(c => c._id === conversationId);
+    if (conv) {
+      conv.lastMessage = content.substring(0, 100);
+      conv.lastMessageAt = new Date();
+    }
+    // Emit via WebSocket
+    io.to(`user-${receiverId}`).emit('new_message', msg);
+    io.to(`user-${senderId}`).emit('message_sent', msg);
+    res.status(201).json({ success: true, data: msg });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// Get unread count
+app.get('/api/messaging/unread', requireMsgAuth, async (req, res) => {
+  try {
+    const userId = req.query.userId;
+    if (!userId) return res.json({ success: true, count: 0 });
+    if (isDbConnected) {
+      const count = await DirectMessage.countDocuments({ receiverId: userId, isRead: false });
+      return res.json({ success: true, count });
+    }
+    const count = DEMO_MESSAGES.filter(m => m.receiverId === userId && !m.isRead).length;
+    res.json({ success: true, count });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── WebSocket (Socket.IO) ────────────────────────────────────────────────────
+const onlineUsers = new Map(); // userId -> socketId
+
+io.on('connection', (socket) => {
+  console.log('🔌 Socket connected:', socket.id);
+
+  socket.on('register', (userId) => {
+    onlineUsers.set(userId, socket.id);
+    socket.join(`user-${userId}`);
+    io.emit('user_online', { userId, isOnline: true });
+    console.log(`✅ User ${userId} registered (socket: ${socket.id})`);
+  });
+
+  socket.on('typing', ({ conversationId, senderId, receiverId }) => {
+    io.to(`user-${receiverId}`).emit('user_typing', { conversationId, senderId });
+  });
+
+  socket.on('stop_typing', ({ conversationId, senderId, receiverId }) => {
+    io.to(`user-${receiverId}`).emit('user_stop_typing', { conversationId, senderId });
+  });
+
+  socket.on('mark_read', ({ conversationId, userId }) => {
+    // Mark messages as read
+    if (isDbConnected) {
+      DirectMessage.updateMany(
+        { conversationId, receiverId: userId, isRead: false },
+        { isRead: true, readAt: new Date() }
+      ).catch(err => console.error('Mark read error:', err));
+    } else {
+      DEMO_MESSAGES.forEach(m => {
+        if (m.conversationId === conversationId && m.receiverId === userId) m.isRead = true;
+      });
+    }
+  });
+
+  socket.on('disconnect', () => {
+    let disconnectedUser = null;
+    for (const [userId, socketId] of onlineUsers.entries()) {
+      if (socketId === socket.id) {
+        disconnectedUser = userId;
+        onlineUsers.delete(userId);
+        break;
+      }
+    }
+    if (disconnectedUser) {
+      io.emit('user_online', { userId: disconnectedUser, isOnline: false });
+      console.log(`❌ User ${disconnectedUser} disconnected`);
+    }
+  });
+});
+
+// ─── Start Server ─────────────────────────────────────────────────────────────
+server.listen(PORT, () => {
+  console.log(`\n🚀 Cotton Mitra Server running on http://localhost:${PORT}`);
+  console.log(`📊 Dashboard: http://localhost:${PORT}/dashboard`);
+  console.log(`🔑 Login:     http://localhost:${PORT}/login`);
+  console.log(`💬 WebSocket: ws://localhost:${PORT} (Socket.IO)\n`);
+});
